@@ -1,0 +1,3 @@
+*.gguf -text -diff
+*.onnx -text -diff
+*.npz -text -diff

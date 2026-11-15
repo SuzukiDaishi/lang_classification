@@ -1,0 +1,24 @@
+[package]
+name = "speech-lid"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+half = "2.7"
+realfft = "3.5"
+serde_json = "1"
+symphonia = { version = "0.5.5", optional = true, default-features = false, features = ["wav", "pcm", "flac", "mp3", "ogg", "vorbis"] }
+
+[features]
+default = ["audio-files"]
+audio-files = ["dep:symphonia"]
+
+[[bin]]
+name = "speech-lid"
+path = "src/main.rs"
+required-features = ["audio-files"]
+
+[profile.release]
+lto = "thin"
