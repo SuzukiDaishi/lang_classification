@@ -2,6 +2,8 @@
 
 音声の先頭30秒から発話言語を99言語の中から判定します。OpenAI Whisper tiny 多言語版の言語判定部分を取り出し、10ビットの重みをGGUFとONNXで提供します。Rust版はWindows x64のCPUとVulkanで動作確認済みです。
 
+元モデルはOpenAI公式の多言語版 `tiny.pt` です。元のコードとモデル重みはMITライセンス（Copyright (c) 2022 OpenAI）で公開されています。本プロジェクトでは追加学習を行わず、言語判定に必要な部分を抽出して変換しました。[公式リポジトリ](https://github.com/openai/whisper/tree/v20250625) · [元モデルのライセンス](model/LICENSE) · [モデルの作成手順とSHA-256](docs/model-conversion.md)
+
 | モデル | ファイルサイズ | 使い方 |
 |---|---:|---|
 | [10ビットGGUF](model/lid10.gguf) | 23,403,136バイト | このリポジトリのRustライブラリ・CLIで使用。アーキテクチャは `whisper-lid10` |
