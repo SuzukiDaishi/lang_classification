@@ -16,6 +16,9 @@ pub struct Weights {
     base: usize,
     entries: HashMap<String, Entry>,
     pub labels: Vec<String>,
+    pub decoder_rank: Option<i64>,
+    pub encoder_mlp_width: i64,
+    pub pool_after: Option<usize>,
 }
 fn take<const N: usize>(c: &mut Cursor<&[u8]>) -> Result<[u8; N]> {
     let mut b = [0; N];
@@ -52,10 +55,35 @@ impl Weights {
             ensure!(u32le(&mut c)? == 8, "expected string metadata");
             meta.insert(key, string(&mut c)?);
         }
-        ensure!(
-            meta.get("general.architecture").map(String::as_str) == Some("whisper-lid10"),
-            "wrong GGUF architecture"
-        );
+        let (decoder_rank, encoder_mlp_width) =
+            match meta.get("general.architecture").map(String::as_str) {
+                Some("whisper-lid10") => (None, 1536),
+                Some("whisper-lid10-cal96") => (Some(96), 1536),
+                Some("whisper-lid-cal96-q8") => {
+                    let width: i64 = meta
+                        .get("lid.encoder_mlp_width")
+                        .context("missing encoder MLP width")?
+                        .parse()?;
+                    ensure!(
+                        (32..=1536).contains(&width) && width % 32 == 0,
+                        "invalid encoder MLP width"
+                    );
+                    (Some(96), width)
+                }
+                _ => bail!("unsupported LID GGUF architecture"),
+            };
+        let pool_after = meta
+            .get("lid.encoder_pool_after")
+            .map(|value| value.parse::<usize>())
+            .transpose()?;
+        if let Some(layer) = pool_after {
+            ensure!(
+                meta.get("general.architecture").map(String::as_str)
+                    == Some("whisper-lid-cal96-q8")
+                    && (1..=3).contains(&layer),
+                "invalid encoder pooling layer"
+            );
+        }
         let labels: Vec<_> = meta
             .get("lid10.labels")
             .context("missing labels")?
@@ -87,6 +115,9 @@ impl Weights {
             entries,
             base,
             labels,
+            decoder_rank,
+            encoder_mlp_width,
+            pool_after,
         })
     }
     fn data(&self, name: &str, n: usize) -> Result<(u32, &[u8])> {
@@ -99,19 +130,30 @@ impl Weights {
             "{name}: expected {n} elements, got {}",
             e.count
         );
-        let width = match e.ty {
-            0 | 26 => 4,
-            1 => 2,
+        let bytes = match e.ty {
+            0 | 26 => n.checked_mul(4),
+            1 => n.checked_mul(2),
+            8 if n.is_multiple_of(32) => (n / 32).checked_mul(34),
             _ => bail!("unsupported tensor type"),
-        };
+        }
+        .context("overflow")?;
         let start = self.base.checked_add(e.offset).context("bad offset")?;
-        let end = start
-            .checked_add(n.checked_mul(width).context("overflow")?)
-            .context("bad size")?;
+        let end = start.checked_add(bytes).context("bad size")?;
         Ok((
             e.ty,
             self.file.get(start..end).context("truncated GGUF data")?,
         ))
+    }
+    pub fn q8_matrix(&self, name: &str, n: usize) -> Result<Option<&[u8]>> {
+        if self.entries.get(name).is_some_and(|entry| entry.ty == 8) {
+            return Ok(Some(self.data(name, n)?.1));
+        }
+        Ok(None)
+    }
+    pub fn f16_values(&self, name: &str, n: usize) -> Result<&[u8]> {
+        let (ty, bytes) = self.data(name, n)?;
+        ensure!(ty == 1, "expected FP16 tensor {name}");
+        Ok(bytes)
     }
     pub fn values(&self, name: &str, n: usize) -> Result<Vec<f32>> {
         let (ty, b) = self.data(name, n)?;

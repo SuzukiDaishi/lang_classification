@@ -66,6 +66,9 @@ struct Builder<'a> {
     wc: H,
     model: &'a Weights,
     uploads: Vec<(H, Vec<f32>)>,
+    native_uploads: Vec<(H, &'a [u8])>,
+    f16_conv: bool,
+    cpu: bool,
     handles: HashMap<String, H>,
 }
 impl Builder<'_> {
@@ -74,6 +77,23 @@ impl Builder<'_> {
             return Ok(handle);
         }
         let n = dims.iter().product::<i64>() as usize;
+        if packed && let Some(bytes) = self.model.q8_matrix(name, n)? {
+            ensure!(dims[0] % 32 == 0, "unaligned Q8_0 matrix {name}");
+            let ty = if self.cpu { 0 } else { 8 };
+            let t = unsafe { ggml_new_tensor(self.wc, ty, dims.len() as i32, dims.as_ptr()) };
+            self.handles.insert(name.to_string(), t);
+            if self.cpu {
+                // Expand once at load time. FP32 GEMM is faster for these CPU matrix shapes.
+                let values = bytes.chunks_exact(34).flat_map(|block| {
+                    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+                    block[2..].iter().map(move |v| (*v as i8) as f32 * scale)
+                });
+                self.uploads.push((t, values.collect()));
+            } else {
+                self.native_uploads.push((t, bytes));
+            }
+            return Ok(t);
+        }
         let data = if packed {
             self.model.matrix(name, n)?
         } else {
@@ -105,11 +125,35 @@ impl Builder<'_> {
         Ok(unsafe { ggml_add(self.c, y, b) })
     }
     fn conv(&mut self, x: H, name: &str, channels: i64, tokens: i64, stride: i32) -> Result<H> {
-        let w = self.weight(&format!("{name}.weight"), &[3, channels, 384], false)?;
+        let key = format!("{name}.weight");
+        let dims = [3, channels, 384];
+        let w = if let Some(&t) = self.handles.get(&key) {
+            t
+        } else if self.f16_conv {
+            let bytes = self.model.f16_values(&key, (3 * channels * 384) as usize)?;
+            let t = unsafe { ggml_new_tensor(self.wc, 1, 3, dims.as_ptr()) };
+            self.native_uploads.push((t, bytes));
+            self.handles.insert(key, t);
+            t
+        } else {
+            self.weight(&key, &dims, false)?
+        };
         let b = self.weight(&format!("{name}.bias"), &[384], false)?;
         let c = self.c;
         unsafe {
-            let cols = ggml_im2col(c, w, x, stride, 0, 1, 0, 1, 0, false, 0);
+            let cols = ggml_im2col(
+                c,
+                w,
+                x,
+                stride,
+                0,
+                1,
+                0,
+                1,
+                0,
+                false,
+                i32::from(self.f16_conv),
+            );
             let y = ggml_mul_mat(
                 c,
                 ggml_reshape_2d(c, w, 3 * channels, 384),
@@ -118,49 +162,75 @@ impl Builder<'_> {
             Ok(ggml_gelu_erf(c, ggml_add(c, y, b)))
         }
     }
-    fn mlp(&mut self, x: H, stem: &str) -> Result<H> {
+    fn mlp_linear(&mut self, x: H, name: &str, ni: i64, no: i64, rank: Option<i64>) -> Result<H> {
+        let Some(rank) = rank else {
+            return self.linear(x, name, ni, no, true);
+        };
+        let a = self.linear(x, &format!("{name}.a"), ni, rank, false)?;
+        self.linear(a, &format!("{name}.b"), rank, no, true)
+    }
+    fn mlp(&mut self, x: H, stem: &str, width: i64, rank: Option<i64>) -> Result<H> {
         let a = self.norm(x, &format!("{stem}.mlp_ln"))?;
-        let b = self.linear(a, &format!("{stem}.mlp0"), 384, 1536, true)?;
+        let b = self.mlp_linear(a, &format!("{stem}.mlp0"), 384, width, rank)?;
         let b = unsafe { ggml_gelu_erf(self.c, b) };
-        let y = self.linear(b, &format!("{stem}.mlp2"), 1536, 384, true)?;
+        let y = self.mlp_linear(b, &format!("{stem}.mlp2"), width, 384, rank)?;
         Ok(unsafe { ggml_add(self.c, x, y) })
     }
-    fn encoder_block(&mut self, x: H, stem: &str) -> Result<H> {
+    fn encoder_block(&mut self, x: H, stem: &str, tokens: i64) -> Result<H> {
         let a = self.norm(x, &format!("{stem}.attn_ln"))?;
         let c = self.c;
-        let heads = |t| unsafe { ggml_permute(c, ggml_reshape_3d(c, t, 64, 6, 1500), 0, 2, 1, 3) };
+        let heads =
+            |t| unsafe { ggml_permute(c, ggml_reshape_3d(c, t, 64, 6, tokens), 0, 2, 1, 3) };
         let q = heads(self.linear(a, &format!("{stem}.query"), 384, 384, true)?);
         let k = heads(self.linear(a, &format!("{stem}.key"), 384, 384, false)?);
         let v = heads(self.linear(a, &format!("{stem}.value"), 384, 384, true)?);
         let mixed = unsafe {
             let att = ggml_flash_attn_ext(c, q, k, v, null_mut(), 0.125, 0., 0.);
             ggml_prec_set_acc(att, 10);
-            ggml_reshape_2d(c, att, 384, 1500)
+            ggml_reshape_2d(c, att, 384, tokens)
         };
         let y = self.linear(mixed, &format!("{stem}.out"), 384, 384, true)?;
-        self.mlp(unsafe { ggml_add(c, x, y) }, stem)
+        self.mlp(
+            unsafe { ggml_add(c, x, y) },
+            stem,
+            self.model.encoder_mlp_width,
+            None,
+        )
     }
-    fn decoder_block(&mut self, x: H, audio: H, audio_t: H, stem: &str) -> Result<H> {
+    fn decoder_block(&mut self, x: H, audio: H, audio_t: H, index: usize) -> Result<H> {
         let c = self.c;
-        let a = self.norm(x, &format!("{stem}.attn_ln"))?;
-        let v = self.linear(a, &format!("{stem}.value"), 384, 384, true)?;
-        let s = self.linear(v, &format!("{stem}.out"), 384, 384, true)?;
-        let x = unsafe { ggml_add(c, x, s) };
-        let a = self.norm(x, &format!("{stem}.cross_ln"))?;
-        let q = self.linear(a, &format!("{stem}.cross.query"), 384, 384, true)?;
-        let k = self.weight(&format!("{stem}.cross.key"), &[384, 64, 6], true)?;
+        let stem = format!("d{index}");
+        let rank = self.model.decoder_rank;
+        let (x, query) = if index == 0 && rank.is_some() {
+            (x, self.weight("d0.fixed_kq", &[384, 6], false)?)
+        } else {
+            let a = self.norm(x, &format!("{stem}.attn_ln"))?;
+            let s = if rank.is_some() {
+                self.linear(a, &format!("{stem}.self"), 384, 384, true)?
+            } else {
+                let v = self.linear(a, &format!("{stem}.value"), 384, 384, true)?;
+                self.linear(v, &format!("{stem}.out"), 384, 384, true)?
+            };
+            let x = unsafe { ggml_add(c, x, s) };
+            let a = self.norm(x, &format!("{stem}.cross_ln"))?;
+            let q = self.linear(a, &format!("{stem}.cross.query"), 384, 384, true)?;
+            let k = self.weight(&format!("{stem}.cross.key"), &[384, 64, 6], true)?;
+            let query = unsafe {
+                let kt = ggml_cont(c, ggml_permute(c, k, 1, 0, 2, 3));
+                ggml_reshape_2d(
+                    c,
+                    ggml_mul_mat(c, kt, ggml_reshape_3d(c, q, 64, 1, 6)),
+                    384,
+                    6,
+                )
+            };
+            (x, query)
+        };
         let v = self.weight(&format!("{stem}.cross.value"), &[384, 64, 6], true)?;
         let bias = self.weight(&format!("{stem}.cross.value.bias"), &[384], false)?;
         // One decoder query: q·(K·audio) = (Kᵀ·q)·audio. Apply each V head
         // after its weighted sum. This avoids projecting 1500 K/V vectors per layer.
         let mixed = unsafe {
-            let kt = ggml_cont(c, ggml_permute(c, k, 1, 0, 2, 3));
-            let query = ggml_reshape_2d(
-                c,
-                ggml_mul_mat(c, kt, ggml_reshape_3d(c, q, 64, 1, 6)),
-                384,
-                6,
-            );
             let probs = ggml_soft_max(c, ggml_scale(c, ggml_mul_mat(c, audio, query), 0.125));
             let pooled = ggml_reshape_3d(c, ggml_mul_mat(c, audio_t, probs), 384, 1, 6);
             ggml_add(
@@ -170,7 +240,7 @@ impl Builder<'_> {
             )
         };
         let out = self.linear(mixed, &format!("{stem}.cross.out"), 384, 384, true)?;
-        self.mlp(unsafe { ggml_add(c, x, out) }, stem)
+        self.mlp(unsafe { ggml_add(c, x, out) }, &stem, 1536, rank)
     }
 }
 
@@ -236,14 +306,18 @@ impl Engine {
             let wc = ctx()?;
             let gc = ctx()?;
             let c = gc.handle;
+            let cpu = backend_name == "CPU";
+            let compact = model.q8_matrix("e0.query", 384 * 384)?.is_some();
             let mut build = Builder {
                 handles: HashMap::new(),
                 c,
                 wc: wc.handle,
                 model,
                 uploads: Vec::new(),
+                native_uploads: Vec::new(),
+                f16_conv: compact,
+                cpu,
             };
-            let cpu = backend_name == "CPU";
             let mut convolutions = Vec::new();
             let mut conv_graphs = Vec::new();
             let mut build_conv = |frames| -> Result<(H, H)> {
@@ -274,14 +348,28 @@ impl Engine {
                 build_conv(3000)?
             };
             x = ggml_add(c, x, build.weight("position", &[384, 1500], false)?);
+            let mut tokens = 1500;
             for i in 0..4 {
-                x = build.encoder_block(x, &format!("e{i}"))?;
+                x = build.encoder_block(x, &format!("e{i}"), tokens)?;
+                if model.pool_after == Some(i + 1) {
+                    tokens /= 2;
+                    // The two views select alternating time steps of the [384, time] tensor.
+                    let frame_bytes = 384 * size_of::<f32>();
+                    let even = ggml_view_2d(c, x, 384, tokens, 2 * frame_bytes, 0);
+                    let odd = ggml_view_2d(c, x, 384, tokens, 2 * frame_bytes, frame_bytes);
+                    x = ggml_scale(c, ggml_add(c, even, odd), 0.5);
+                }
             }
             let audio = build.norm(x, "enc_ln")?;
             let audio_t = ggml_cont(c, ggml_transpose(c, audio));
-            x = build.weight("sot", &[384, 1], false)?;
+            let initial = if model.decoder_rank.is_some() {
+                "d0.fixed_x"
+            } else {
+                "sot"
+            };
+            x = build.weight(initial, &[384, 1], false)?;
             for i in 0..4 {
-                x = build.decoder_block(x, audio, audio_t, &format!("d{i}"))?;
+                x = build.decoder_block(x, audio, audio_t, i)?;
             }
             x = build.norm(x, "dec_ln")?;
             let output = build.linear(x, "head", 384, 99, false)?;
@@ -303,6 +391,9 @@ impl Engine {
             )?;
             for (t, data) in build.uploads {
                 ggml_backend_tensor_set(t, data.as_ptr().cast(), 0, data.len() * 4);
+            }
+            for (t, bytes) in build.native_uploads {
+                ggml_backend_tensor_set(t, bytes.as_ptr().cast(), 0, bytes.len());
             }
             for (frames, input, output, graph) in conv_graphs {
                 convolutions.push(ConvPlan {

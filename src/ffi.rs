@@ -33,6 +33,7 @@ unsafe extern "C" {
     pub fn ggml_reshape_3d(c: H, a: H, n0: i64, n1: i64, n2: i64) -> H;
     pub fn ggml_transpose(c: H, a: H) -> H;
     pub fn ggml_cont(c: H, a: H) -> H;
+    pub fn ggml_view_2d(c: H, a: H, n0: i64, n1: i64, nb1: usize, offset: usize) -> H;
     pub fn ggml_permute(c: H, a: H, x: c_int, y: c_int, z: c_int, w: c_int) -> H;
     pub fn ggml_im2col(
         c: H,
